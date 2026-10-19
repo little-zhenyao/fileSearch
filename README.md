@@ -1,0 +1,124 @@
+# 书间 Course Search
+
+macOS 本地离线课程资料检索工具。导入 PDF、DOCX 后建立索引，搜索英文术语、完整短语或中文连续字串，点击结果在应用内回到原文。
+
+## 开始使用
+
+当前工作区已安装依赖并构建前端，直接双击 **启动.command** 即可使用。默认地址为 [http://127.0.0.1:8765](http://127.0.0.1:8765)；端口被占用时会自动选择空闲端口，以启动窗口显示的地址为准。
+
+首次在另一台 Mac 使用：
+
+1. 安装 Python 3.10 或以上版本，推荐 Python 3.12；系统自带 Python 可能不满足要求。
+2. 联网双击 **安装.command**。脚本创建项目专用 Python 环境、安装锁定依赖，并构建前端。缺少合适的 Node 时会下载并校验官方 Node 22.16.0 至项目内部；Node 仅用于安装阶段。
+3. 双击 **启动.command**，浏览器会自动打开。首次选择资料库目录，也可直接填写路径。
+4. 新建课程，点击“导入资料”，选择文件或整个文件夹。等待索引完成后搜索。
+5. 保留启动的终端窗口。退出时按 Control+C，或双击 **停止.command**。
+
+安装完成后的启动、导入、搜索和阅读均不访问外部服务。应用只监听 `127.0.0.1`；前端、PDF worker、CMap、字体和 WASM 均由本地服务提供。关闭浏览器标签页不会停止服务；重复启动会复用已运行的服务。
+
+若 Finder 不允许执行脚本，在项目目录运行一次：
+
+```bash
+chmod +x 安装.command 启动.command 停止.command
+```
+
+目录选择窗口不可用时，直接在首次设置界面填写本机绝对路径。资料库路径一经配置，V1 不在运行中切换目录。
+
+## 搜索规则
+
+| 模式 | 行为 |
+|---|---|
+| 全部词 | 同一 PDF 页、DOCX 段落或表格单元格包含所有查询词 |
+| 任一词 | 包含任一查询词 |
+| 完整短语 | 连续匹配输入短语，合并多余空白，不跨页、段落或单元格 |
+
+- 默认当前课程，可切换全部课程，并按 Lecture、Tutorial、Summary、Other 筛选。
+- 英文忽略大小写，按完整词匹配。`deadlock` 不自动匹配 `deadlocks`，无词形或同义词扩展。
+- 中文连续字串可出现在更长句子中；一两个字的短查询使用已提取文本匹配。三字及以上使用 trigram 获取候选，再复核原文。
+- 兼容字符、常见英文换行断词、软连字符和空白会规范化，结果保留原文及字符映射。完整短语保留标点含义。
+- 按文件分组和相关性排序，文件内按原文顺序排列；每批最多展示 20 个文件、每文件 20 个位置，可继续加载。
+- `⌘K` 聚焦搜索。搜索框按 ↓ 进入结果列表，↑/↓ 选择，Enter 打开原文。阅读工具栏的左右按钮切换同一单元的命中。
+
+英文跨行连字符的合并只处理“字母 + 连字符 + 换行 + 小写字母”的常见断词，不能自动辨别所有 PDF 排版中的真实复合词。多栏阅读顺序也受 PDF 文字结构影响，需用实际课件抽检。
+
+## 阅读和资料状态
+
+- **PDF**：显示原文件；支持连续滚动、页码跳转、缩放、旋转和原文选择。搜索高亮按原文件坐标显示。无法精确定位时保留页级定位并提示使用页内查找。页内查找会高亮包含查询的文字片段，跨片段的匹配以主搜索为准。
+- **DOCX**：显示标题、正文和基础表格的结构化文本预览，以段落或单元格定位；不承诺 Word 页码或原始版式。图片、浮动对象、文本框、页眉页脚和批注不进入检索。
+- **状态**：可搜索、部分可搜索、无可提取文字、需密码、失败分别展示。扫描页可以阅读，V1 不进行 OCR。
+- **导入与索引**面板显示每文件处理状态、失败原因和重试。加密文件应先在外部生成可使用的未加密副本后重新导入；直接重试不会自动解密。
+- 相同课程内相同内容不重复索引，其他课程可单独关联。相同相对路径、不同内容会等待“确认替换”；新文件解析成功后才切换索引，失败时保留旧资料。
+- 文件夹导入保留浏览器提供的根文件夹名称和相对路径；同一份资料请保持相同的导入路径方式以识别替换。
+- 手动重建使用资料库中的副本；外部原始文件变化后需重新导入。重建期间旧索引仍可搜索；成功后旧结果会提示重新搜索。
+- 处理中退出时，重启会重新执行未完成项。已完成资料无需重建。
+
+## 存储、备份与迁移
+
+所选资料库包含：
+
+```text
+资料库/
+  files/                 # 按内容哈希保存的文件副本
+  library.sqlite3        # 课程、文件、原文、位置、FTS 索引及任务记录
+```
+
+项目内 `.local/settings.json` 记录资料库目录，`.local/server.json` 记录当前服务地址；`.venv`、`.local/node` 和 `frontend/dist` 是安装产物。左下角可查看实际目录和占用空间。
+
+备份前先停止服务，再复制整个资料库目录。SQLite 的 `-wal`、`-shm` 文件若仍存在，应一并保留。迁移后，在服务停止的情况下修改 `.local/settings.json` 中的 `library_path` 为新目录的绝对路径，再启动。不要同时用不同项目副本打开同一个资料库。
+
+V1 暂无删除资料与自动清理入口；替换前的副本及失败导入副本可能仍占用空间。不要手动删除正在使用的数据库或 `files` 内文件。需要全新资料库时先备份、停止服务，再移走 `.local/settings.json`，下次启动重新选择。
+
+项目移动后，请重新运行安装脚本；Python 虚拟环境中的路径可能与原位置绑定。
+
+## 开发与验证
+
+前端 React + TypeScript + PDF.js；后端 FastAPI + PyMuPDF + python-docx；SQLite FTS5 的 unicode61 与 trigram 双索引。依赖版本分别锁定于 `requirements.txt`、`requirements-dev.txt` 与 `frontend/pnpm-lock.yaml`。
+
+```bash
+# 安装测试依赖
+.venv/bin/python -m pip install -r requirements-dev.txt
+
+# 后端集成与回归测试
+.venv/bin/python -m pytest -q
+
+# 生成 12 份合成样本（不会导入正式资料库）
+.venv/bin/python scripts/make_samples.py
+
+# 100 文件、3000 页合成性能测试，默认每种查询测 20 次
+.venv/bin/python scripts/benchmark.py
+
+# 运行后端开发服务
+FILESEARCH_DEV=1 .venv/bin/python -m uvicorn backend.app:app --host 127.0.0.1 --port 8765
+
+# 前端开发（首次安装会提供项目内 Node 与 pnpm）
+export PATH="$PWD/.local/node/bin:$PATH"
+cd frontend
+../.local/node/bin/node ../.local/build-tools/node_modules/pnpm/bin/pnpm.cjs dev
+```
+
+前端开发命令需将项目 `.local/node/bin` 加入 PATH，或使用系统 Node >=22.13。正式构建运行 `pnpm build`；运行阶段只需 Python，无需启动 Vite。
+
+浏览器回归脚本 `scripts/browser_smoke.cjs` 需要额外可用的 Playwright 和 Chrome。**仅对独立测试服务运行**，脚本会创建测试课程并导入合成文件：
+
+```bash
+FILESEARCH_CONFIG="$PWD/.local/qa/settings.json" .venv/bin/python -m uvicorn backend.app:app --host 127.0.0.1 --port 8766
+# 另一终端，确保 node 和 playwright 可用
+node scripts/browser_smoke.cjs
+```
+
+脚本拦截所有外部请求，验证导入、PDF 和 DOCX 定位、中文搜索、刷新持久化及窄屏显示；截图与报告写入 `.local/browser-qa`。查看 [验收记录](docs/acceptance.md) 了解当前实际验证范围。
+
+## API 约定
+
+- `/api/settings`：读取、首次配置资料库；`/api/settings/pick-directory` 调用 macOS 目录选择窗口。
+- `/api/courses`：列出和新建课程。
+- `/api/documents`：列出资料，支持课程及类别筛选。`PATCH /{id}` 修改分类，`POST /{id}/rebuild` 重建。
+- `/api/import-jobs`：multipart 导入；字段为 `course_id`、JSON 字符串 `paths` 以及重复的 `files`。GET 返回最近 30 个任务；GET `/{id}` 返回指定任务。
+- `POST /api/import-jobs/{job}/items/{item}/retry`：重试，JSON `replace_existing: true` 用于明确确认冲突替换。
+- `/api/search`：`q`、`mode=all|any|phrase`、可选 `course_id/category/document_id`、`offset/limit/unit_offset`。返回文件分组、总命中数、单元位置、原文范围、摘要与下一页偏移。
+- `/api/documents/{id}/content`：PDF 原文或 DOCX 结构化预览。
+- `/api/documents/{id}/units/{unit_id}`：点击时延迟获取定位锚点；传入 `q/mode` 返回全部匹配范围和 PDF 原生坐标矩形。可传 `version` 检查过期结果。
+
+所有字符范围使用 Unicode 码点、左闭右开；PDF 页码从 1 开始，DOCX 表格行列从 0 开始。PDF 矩形为原生 PDF user space，前端使用 PDF.js viewport 转换。写请求须携带 `X-Local-Request: 1`，浏览器请求来源也会校验；不提供外部跨域访问。
+
+V1 不包含 OCR、收藏历史、双文档阅读、语义搜索、自动答案或独立安装包。真实课程资料的版式回归与设备上的模拟考试仍需在使用前完成。
