@@ -7,6 +7,7 @@ __pycache__/
 .coverage
 .DS_Store
 .local/
+.pnpm-store/
 *.pyc
 *.tsbuildinfo
 *.log
