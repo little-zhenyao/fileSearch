@@ -5,7 +5,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const base = process.env.FILESEARCH_TEST_URL || 'http://127.0.0.1:8766';
 const root = path.resolve(__dirname, '..');
-const output = path.join(root, '.local', 'browser-qa');
+const output = process.env.FILESEARCH_TEST_OUTPUT || path.join(root, '.local', 'browser-qa');
 fs.mkdirSync(output, { recursive: true });
 
 (async () => {
@@ -26,7 +26,7 @@ fs.mkdirSync(output, { recursive: true });
   if (!configured.configured) {
     await page.getByText('选择你的资料库目录', { exact: true }).waitFor();
     await page.screenshot({ path: path.join(output, '01-setup.png') });
-    await page.getByLabel('选择你的资料库目录').fill(path.join(root, '.local', 'qa', 'library'));
+    await page.getByLabel('选择你的资料库目录').fill(process.env.FILESEARCH_TEST_LIBRARY || path.join(root, '.local', 'qa', 'library'));
     await page.getByRole('button', { name: '创建资料库，开始使用' }).click();
   }
   const courses = await (await page.request.get(base + '/api/courses')).json();
@@ -46,6 +46,14 @@ fs.mkdirSync(output, { recursive: true });
   await page.locator(`[data-job="${job_id}"]`).getByText(`${files.length} / ${files.length} 已处理`).waitFor({ timeout: 30000 });
   await page.screenshot({ path: path.join(output, '02-import.png') });
   await page.getByRole('button', { name: '关闭导入任务' }).click();
+  // V2 persists its workspace: make this legacy exact-search regression independent
+  // of a previous comparison session or an enabled expansion preference.
+  const closeComparison = page.getByRole('button', { name: '关闭双栏', exact: true });
+  if (await closeComparison.count()) await closeComparison.click();
+  const expansion = page.getByLabel('本地词形与同义词');
+  if (await expansion.count()) await expansion.uncheck();
+  const scope = page.getByLabel('搜索范围');
+  if (await scope.count()) await scope.selectOption('course');
   const input = page.getByLabel('搜索课程资料');
   await input.fill('deadlock'); await page.getByRole('button', { name: '搜索', exact: true }).click();
   await page.locator('.result-group').first().waitFor();

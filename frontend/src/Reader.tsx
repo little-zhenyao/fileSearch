@@ -9,7 +9,13 @@ import {
 } from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import "pdfjs-dist/web/pdf_viewer.css";
-import { api, type PreviewUnit, type Selection, type Unit } from "./types";
+import {
+  api,
+  type PreviewUnit,
+  type Selection,
+  type Unit,
+  type ReadingPosition,
+} from "./types";
 import { Highlight } from "./Highlight";
 import { Icon } from "./icons";
 
@@ -27,6 +33,7 @@ function PdfPage({
   find,
   scroller,
   onLocated,
+  autoLocate,
 }: {
   pdf: PDFDocumentProxy;
   number: number;
@@ -39,6 +46,7 @@ function PdfPage({
   find: string;
   scroller: React.RefObject<HTMLDivElement | null>;
   onLocated: (number: number) => void;
+  autoLocate: boolean;
 }) {
   const outer = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -132,6 +140,7 @@ function PdfPage({
         }
       }
       if (
+        autoLocate &&
         isTarget &&
         locatedToken.current !== targetToken &&
         outer.current &&
@@ -163,14 +172,17 @@ function PdfPage({
       cancelled = true;
       task?.cancel();
       layer?.cancel();
+      element.width = 0;
+      element.height = 0;
+      container.replaceChildren();
     };
-  }, [page, visible, scale, totalRotation, find, targetToken]);
+  }, [page, visible, scale, totalRotation, find, targetToken, autoLocate]);
 
   useEffect(() => {
-    if (isTarget && targetToken !== locatedToken.current) {
+    if (autoLocate && isTarget && targetToken !== locatedToken.current) {
       outer.current?.scrollIntoView({ block: "start", behavior: "instant" });
     }
-  }, [targetToken, isTarget]);
+  }, [targetToken, isTarget, autoLocate]);
 
   return (
     <div
@@ -188,12 +200,14 @@ function PdfPage({
           <div
             ref={textContainer}
             className="textLayer"
-            style={{
-              "--scale-factor": scale,
-              "--total-scale-factor": scale * (page?.userUnit || 1),
-              "--scale-round-x": "1px",
-              "--scale-round-y": "1px",
-            } as React.CSSProperties}
+            style={
+              {
+                "--scale-factor": scale,
+                "--total-scale-factor": scale * (page?.userUnit || 1),
+                "--scale-round-x": "1px",
+                "--scale-round-y": "1px",
+              } as React.CSSProperties
+            }
           />
           {isTarget && viewport && (
             <div className="pdf-highlights">
@@ -234,23 +248,33 @@ function DocxPreview({
   units,
   active,
   current,
+  paneId,
+  scroller,
+  autoLocate,
+  navigation,
 }: {
   units: PreviewUnit[];
   active: Unit | null;
   current: number;
+  paneId: string;
+  scroller: React.RefObject<HTMLDivElement | null>;
+  autoLocate: boolean;
+  navigation: number;
 }) {
   useEffect(() => {
-    if (active)
-      document
-        .getElementById(`unit-${active.unit_id}`)
+    if (active && autoLocate)
+      scroller.current
+        ?.querySelector(`[data-unit-id="${active.unit_id}"]`)
         ?.scrollIntoView({ block: "center", behavior: "instant" });
-  }, [active, current, units]);
+  }, [active, current, units, autoLocate, scroller, navigation]);
   const parts: React.ReactNode[] = [];
   for (let i = 0; i < units.length; ) {
     const unit = units[i];
     const content = (value: PreviewUnit) => (
       <span
-        id={`unit-${value.unit_id}`}
+        id={`${paneId}-unit-${value.unit_id}`}
+        data-unit-id={value.unit_id}
+        data-unit-key={value.anchor.key}
         className={active?.unit_id === value.unit_id ? "docx-target" : ""}
       >
         <Highlight
@@ -308,11 +332,19 @@ export function Reader({
   onClose,
   onError,
   onRebuild,
+  paneId = "primary",
+  onPosition,
+  onBookmark,
+  frozen = false,
 }: {
   selection: Selection | null;
   onClose: () => void;
   onError: (message: string) => void;
   onRebuild: (id: string) => void;
+  paneId?: string;
+  onPosition?: (position: ReadingPosition) => void;
+  onBookmark?: () => void;
+  frozen?: boolean;
 }) {
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [units, setUnits] = useState<PreviewUnit[]>([]);
@@ -326,15 +358,131 @@ export function Reader({
   const [error, setError] = useState("");
   const [find, setFind] = useState("");
   const [pageInput, setPageInput] = useState("1");
+  const [followHit, setFollowHit] = useState(false);
+  const pageEditor = useRef<HTMLInputElement>(null);
   const scroller = useRef<HTMLDivElement>(null);
   const doc = selection?.document;
+  const callbacks = useRef({ onPosition });
+  callbacks.current = { onPosition };
+  const restoring = useRef(false);
+  const lastPosition = useRef<ReadingPosition | undefined>(selection?.position);
+  const layoutPosition = useRef<ReadingPosition | undefined>(undefined);
+  const [layoutRevision, setLayoutRevision] = useState(0);
+  const positionSelection = useRef(selection);
+  positionSelection.current = selection;
+  const emit = () => {
+    const element = scroller.current,
+      selected = positionSelection.current;
+    if (
+      !element ||
+      !selected ||
+      restoring.current ||
+      loading ||
+      error ||
+      !element.clientHeight ||
+      !element.clientWidth
+    )
+      return;
+    const rect = element.getBoundingClientRect();
+    // scrollIntoView honors the reader's scroll-padding. A previous PDF page
+    // can leave a thin tail above the requested page; that is not the page
+    // being read. Keep offsets relative to the viewport for existing saves.
+    const pageSelectionTop =
+      selected.document.kind === "pdf"
+        ? rect.top +
+          element.clientTop +
+          (Number.parseFloat(getComputedStyle(element).scrollPaddingTop) || 0)
+        : rect.top;
+    const children = Array.from(
+      element.querySelectorAll<HTMLElement>(
+        selected.document.kind === "pdf" ? "[data-page]" : "[data-unit-id]",
+      ),
+    );
+    const child =
+      children.find(
+        (node) => node.getBoundingClientRect().bottom > pageSelectionTop + 1,
+      ) ?? children.at(-1);
+    if (!child) return;
+    const bounds = child.getBoundingClientRect();
+    const position: ReadingPosition = {
+      document_id: selected.document.id,
+      content_hash: selected.document.content_hash,
+      page: child.dataset.page ? Number(child.dataset.page) : undefined,
+      key: child.dataset.unitKey,
+      unit_id:
+        child.dataset.unitId ??
+        (active?.anchor.page === Number(child.dataset.page)
+          ? active?.unit_id
+          : undefined),
+      offset: Math.max(
+        0,
+        Math.min(1, (rect.top - bounds.top) / Math.max(1, bounds.height)),
+      ),
+      horizontal:
+        element.scrollLeft /
+        Math.max(1, element.scrollWidth - element.clientWidth),
+      lexicon_version:
+        selected.hit?.lexicon_version ?? selected.position?.lexicon_version,
+      hit_unit_id: active?.unit_id,
+      hit_page: active?.anchor.page,
+      hit_key: active?.anchor.key,
+      version: selected.document.version,
+      zoom,
+      rotation: rotation as ReadingPosition["rotation"],
+      match: current,
+      find,
+    };
+    if (position.page && document.activeElement !== pageEditor.current)
+      setPageInput(String(position.page));
+    lastPosition.current = position;
+    callbacks.current.onPosition?.(position);
+  };
+  const emitRef = useRef(emit);
+  emitRef.current = emit;
 
   useEffect(() => {
     const element = scroller.current;
     if (!element) return;
-    const observer = new ResizeObserver((entries) =>
-      setWidth(Math.max(280, entries[0].contentRect.width - 72)),
-    );
+    let frame = 0;
+    const handle = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => emitRef.current());
+    };
+    element.addEventListener("scroll", handle, { passive: true });
+    return () => {
+      element.removeEventListener("scroll", handle);
+      cancelAnimationFrame(frame);
+    };
+  }, [!!doc]);
+  useEffect(() => {
+    emitRef.current();
+  }, [zoom, rotation, find, current]);
+
+  useEffect(() => {
+    const element = scroller.current;
+    if (!element) return;
+    let measuredWidth = 0,
+      wasHidden = false;
+    const observer = new ResizeObserver((entries) => {
+      const nextWidth = entries[0].contentRect.width;
+      if (!nextWidth || !entries[0].contentRect.height) {
+        wasHidden = true;
+        return;
+      }
+      if (
+        measuredWidth &&
+        (wasHidden || Math.abs(measuredWidth - nextWidth) > 2) &&
+        lastPosition.current
+      ) {
+        layoutPosition.current = lastPosition.current;
+        restoring.current = true;
+        setFollowHit(false);
+        setLayoutRevision((value) => value + 1);
+      }
+      wasHidden = false;
+      measuredWidth = nextWidth;
+      setWidth(Math.max(280, nextWidth - 72));
+    });
     observer.observe(element);
     return () => observer.disconnect();
   }, [!!doc]);
@@ -344,12 +492,21 @@ export function Reader({
     setUnits([]);
     setActive(null);
     setCurrent(0);
-    setRotation(0);
-    setZoom(1);
+    setRotation(selection?.position?.rotation ?? 0);
+    setZoom(selection?.position?.zoom ?? 1);
     setError("");
-    setFind("");
-    setPageInput("1");
+    setFind(selection?.position?.find ?? "");
+    setPageInput(String(selection?.position?.page ?? 1));
+    restoring.current = true;
     if (!doc) return;
+    if (
+      selection?.position?.content_hash &&
+      selection.position.content_hash !== doc.content_hash
+    ) {
+      setLoading(false);
+      setError("资料已替换，原位置待确认。请从资料列表重新打开。");
+      return;
+    }
     let cancelled = false;
     setLoading(true);
     const url = `/api/documents/${doc.id}/content?version=${doc.version}`;
@@ -405,16 +562,37 @@ export function Reader({
 
   useEffect(() => {
     setActive(null);
-    setCurrent(0);
-    if (!selection?.hit || !doc) return;
-    setNavigation(value => value + 1);
+    setFollowHit(!!selection?.hit);
+    lastPosition.current = selection?.position;
+    layoutPosition.current = undefined;
+    setCurrent(selection?.position?.match ?? 0);
+    setZoom(selection?.position?.zoom ?? 1);
+    setRotation(selection?.position?.rotation ?? 0);
+    setFind(selection?.position?.find ?? "");
+    restoring.current = true;
+    const unitId =
+      selection?.hit?.unit_id ??
+      selection?.position?.hit_unit_id ??
+      selection?.position?.unit_id;
+    if (!unitId || !doc) return;
+    if (
+      selection?.position?.version &&
+      selection.position.version !== doc.version
+    )
+      return;
+    setNavigation((value) => value + 1);
     let cancelled = false;
     const params = new URLSearchParams({
-      q: selection.query || "",
       mode: selection.mode || "all",
       version: String(doc.version),
+      expand: String(selection?.expand ?? false),
     });
-    api<Unit>(`/documents/${doc.id}/units/${selection.hit.unit_id}?${params}`)
+    const lexiconVersion =
+      selection?.hit?.lexicon_version ?? selection?.position?.lexicon_version;
+    if (lexiconVersion) params.set("lexicon_version", lexiconVersion);
+    if (selection?.query) params.set("q", selection.query);
+    if (selection?.course) params.set("course_id", selection.course);
+    api<Unit>(`/documents/${doc.id}/units/${unitId}?${params}`)
       .then((value) => {
         if (!cancelled) {
           setActive(value);
@@ -427,7 +605,76 @@ export function Reader({
     return () => {
       cancelled = true;
     };
-  }, [selection]);
+  }, [selection?.visitId, doc?.id, doc?.version]);
+
+  useEffect(() => {
+    if (!doc || loading || error || (!pdf && !units.length)) return;
+    const saved = layoutPosition.current ?? selection?.position;
+    const adjustingLayout = !!layoutPosition.current;
+    let frame = 0,
+      attempts = 0;
+    const restore = () => {
+      const element = scroller.current;
+      if (!element || !element.clientHeight || !element.clientWidth) return;
+      if (selection?.hit && !adjustingLayout) {
+        // PdfPage/DocxPreview owns the initial search-hit jump.
+        if (
+          !active ||
+          (doc.kind === "pdf" &&
+            !element.querySelector(".pdf-highlight.active"))
+        ) {
+          if (++attempts < 240) {
+            frame = requestAnimationFrame(restore);
+            return;
+          }
+        }
+        restoring.current = false;
+        emitRef.current();
+        return;
+      }
+      const selector =
+        doc.kind === "pdf"
+          ? `[data-page="${saved?.page ?? 1}"]`
+          : saved?.unit_id
+            ? `[data-unit-id="${saved.unit_id}"]`
+            : "[data-unit-id]";
+      const target = element.querySelector<HTMLElement>(selector);
+      if (!target) {
+        if (++attempts < 240) frame = requestAnimationFrame(restore);
+        return;
+      }
+      const top =
+        element.scrollTop +
+        target.getBoundingClientRect().top -
+        element.getBoundingClientRect().top;
+      element.scrollTop =
+        top + (saved?.offset ?? 0) * target.getBoundingClientRect().height;
+      element.scrollLeft =
+        (saved?.horizontal ?? 0) * (element.scrollWidth - element.clientWidth);
+      if (
+        doc.kind === "pdf" &&
+        !target.querySelector(".textLayer span") &&
+        ++attempts < 180
+      ) {
+        frame = requestAnimationFrame(restore);
+        return;
+      }
+      layoutPosition.current = undefined;
+      restoring.current = false;
+      emitRef.current();
+    };
+    frame = requestAnimationFrame(restore);
+    return () => cancelAnimationFrame(frame);
+  }, [
+    selection?.visitId,
+    doc?.id,
+    pdf,
+    units,
+    active,
+    loading,
+    error,
+    layoutRevision,
+  ]);
 
   if (!doc)
     return (
@@ -462,6 +709,7 @@ export function Reader({
     );
 
   const jumpToPage = () => {
+    setFollowHit(false);
     const page = Math.max(
       1,
       Math.min(pdf?.numPages || 1, Number.parseInt(pageInput) || 1),
@@ -475,9 +723,17 @@ export function Reader({
     active &&
     doc.kind === "pdf" &&
     !active.rectangles?.some((rects) => rects.length);
+  const changeMatch = (step: number) => {
+    if (!active?.ranges.length) return;
+    setFollowHit(true);
+    setNavigation((value) => value + 1);
+    setCurrent(
+      (value) => (value + step + active.ranges.length) % active.ranges.length,
+    );
+  };
 
   return (
-    <section className="reader">
+    <section className="reader" data-reader={paneId}>
       <div className="reader-title">
         <span className={`file-label ${doc.kind}`}>
           {doc.kind.toUpperCase()}
@@ -493,10 +749,21 @@ export function Reader({
         </div>
         <button
           className="icon-button"
+          disabled={frozen}
           title="重新建立此文件索引"
           onClick={() => onRebuild(doc.id)}
         >
           <Icon name="refresh" size={16} />
+        </button>
+        <button
+          className="icon-button"
+          title="收藏当前位置"
+          onClick={() => {
+            emitRef.current();
+            onBookmark?.();
+          }}
+        >
+          <Icon name="bookmark" size={17} />
         </button>
         <button className="icon-button" title="关闭阅读" onClick={onClose}>
           <Icon name="close" size={17} />
@@ -512,6 +779,7 @@ export function Reader({
               }}
             >
               <input
+                ref={pageEditor}
                 aria-label="跳转页码"
                 value={pageInput}
                 onChange={(event) => setPageInput(event.target.value)}
@@ -557,12 +825,7 @@ export function Reader({
               className="icon-button"
               title="上一个命中"
               disabled={!active.ranges.length}
-              onClick={() =>
-                setCurrent(
-                  (value) =>
-                    (value - 1 + active.ranges.length) % active.ranges.length,
-                )
-              }
+              onClick={() => changeMatch(-1)}
             >
               <Icon name="left" size={14} />
             </button>
@@ -573,9 +836,7 @@ export function Reader({
               className="icon-button"
               title="下一个命中"
               disabled={!active.ranges.length}
-              onClick={() =>
-                setCurrent((value) => (value + 1) % active.ranges.length)
-              }
+              onClick={() => changeMatch(1)}
             >
               <Icon name="arrow" size={14} />
             </button>
@@ -616,7 +877,12 @@ export function Reader({
           已跳到正确页，精确高亮不可用，请使用页内查找。
         </div>
       )}
-      <div className="reader-scroll" ref={scroller}>
+      <div
+        className="reader-scroll"
+        ref={scroller}
+        onWheel={() => setFollowHit(false)}
+        onPointerDown={() => setFollowHit(false)}
+      >
         {loading && (
           <div className="reader-loading">
             <span className="spinner" /> 正在加载原文…
@@ -642,11 +908,23 @@ export function Reader({
               navigation={navigation}
               find={find}
               scroller={scroller}
-              onLocated={(number) => setPageInput(String(number))}
+              autoLocate={followHit}
+              onLocated={(number) => {
+                if (document.activeElement !== pageEditor.current)
+                  setPageInput(String(number));
+              }}
             />
           ))}
         {!loading && !error && doc.kind === "docx" && (
-          <DocxPreview units={units} active={active} current={current} />
+          <DocxPreview
+            units={units}
+            active={active}
+            current={current}
+            paneId={paneId}
+            scroller={scroller}
+            autoLocate={followHit}
+            navigation={navigation}
+          />
         )}
       </div>
       <div className="reader-footer">

@@ -17,7 +17,7 @@ def parse_pdf(path: Path) -> tuple[list[dict], str | None]:
     units = []
     with pymupdf.open(path) as document:
         if document.needs_pass:
-            raise PasswordRequired('文件需要密码；V1 请先在外部生成允许使用的未加密副本。')
+            raise PasswordRequired('文件需要密码；请先在外部生成允许使用的未加密副本。')
         for number, page in enumerate(document, 1):
             # get_text coordinates are unrotated, crop-relative MuPDF coordinates.
             # PDF.js expects native PDF user space; remove rotation before obtaining

@@ -5,13 +5,17 @@ import json
 import logging
 import os
 import threading
+import tempfile
+import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
-from .db import Database
+from .db import Database, require_editable
 from .parsers import PasswordRequired, parse, rectangles
-from .text import Query, compact_mapping, is_cjk, normalize, snippet
+from .text import compact_mapping, normalize, snippet
+from .search import SearchPlan
+from .workspace import Workspace, text_hash
 
 CATEGORIES = ('Lecture', 'Tutorial', 'Summary', 'Other')
 TERMINAL = {'ready', 'partial', 'no_text', 'password_required', 'failed', 'duplicate', 'conflict', 'unsupported'}
@@ -42,6 +46,7 @@ def safe_relative_path(value: str) -> str:
 class Library:
     def __init__(self, root: Path):
         self.db = Database(root)
+        self.workspace = Workspace(self.db)
         self.wakeup = threading.Event()
         self.stopping = threading.Event()
         self.thread: threading.Thread | None = None
@@ -70,6 +75,9 @@ class Library:
 
     def process_next(self) -> bool:
         with self.db.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            if self.workspace.state('exam', {}).get('active'):
+                return False
             row = conn.execute("""SELECT i.*,j.course_id FROM job_items i JOIN jobs j ON j.id=i.job_id
                                    WHERE i.status='queued' ORDER BY i.created_at,i.rowid LIMIT 1""").fetchone()
             if row is None:
@@ -136,42 +144,62 @@ class Library:
             raise ValueError('文件和路径数量不一致或未选择文件')
         normalized_paths = [safe_relative_path(path) for path in paths]
         with self.db.connect() as conn:
+            require_editable(conn)
             if not conn.execute('SELECT 1 FROM courses WHERE id=?', (course_id,)).fetchone():
                 raise ValueError('课程不存在')
         items = []
-        for upload, path in zip(uploads, normalized_paths):
-            kind = PurePosixPath(path).suffix.lower().lstrip('.')
-            item_id = uid()
-            if kind not in ('pdf', 'docx'):
-                items.append((item_id, path, kind, '', '', 0, 'unsupported', '仅支持 PDF 和 DOCX'))
-                continue
-            temporary = self.db.root / 'files' / f'.{item_id}.upload'
-            digest = hashlib.sha256()
-            size = 0
-            try:
-                with temporary.open('wb') as stream:
-                    while chunk := await upload.read(1024 * 1024):
-                        digest.update(chunk)
-                        stream.write(chunk)
-                        size += len(chunk)
-                content_hash = digest.hexdigest()
-                blob = f'{content_hash}.{kind}'
-                destination = self.db.root / 'files' / blob
-                if destination.exists():
-                    temporary.unlink()
-                else:
-                    os.replace(temporary, destination)
-                items.append((item_id, path, kind, content_hash, blob, size, 'queued', None))
-            finally:
-                temporary.unlink(missing_ok=True)
-                await upload.close()
-        job_id = uid()
-        with self.db.connect() as conn:
-            conn.execute('INSERT INTO jobs VALUES (?,?,?)', (job_id, now(), course_id))
-            for item in items:
-                conn.execute('''INSERT INTO job_items
-                             (id,job_id,relative_path,kind,content_hash,blob,size,status,error,created_at)
-                             VALUES (?,?,?,?,?,?,?,?,?,?)''', (item[0], job_id, *item[1:], now()))
+        # Uploads can be slow. Stage outside the library so an exam can enter while
+        # uploading, then reject the import without adding blobs or queue records.
+        with tempfile.TemporaryDirectory(prefix='filesearch-import-') as staging:
+            for upload, path in zip(uploads, normalized_paths):
+                kind = PurePosixPath(path).suffix.lower().lstrip('.')
+                item_id = uid()
+                if kind not in ('pdf', 'docx'):
+                    items.append((item_id, path, kind, '', '', 0, 'unsupported', '仅支持 PDF 和 DOCX'))
+                    await upload.close()
+                    continue
+                temporary = Path(staging) / item_id
+                digest = hashlib.sha256()
+                size = 0
+                try:
+                    with temporary.open('wb') as stream:
+                        while chunk := await upload.read(1024 * 1024):
+                            digest.update(chunk)
+                            stream.write(chunk)
+                            size += len(chunk)
+                    content_hash = digest.hexdigest()
+                    blob = f'{content_hash}.{kind}'
+                    items.append((item_id, path, kind, content_hash, blob, size, 'queued', None))
+                finally:
+                    await upload.close()
+            job_id = uid()
+            with self.db.connect() as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                require_editable(conn)
+                for item in items:
+                    item_id, _, _, _, blob, *_ = item
+                    if not blob:
+                        continue
+                    destination = self.db.root / 'files' / blob
+                    try:
+                        with destination.open('rb') as existing_copy:
+                            intact = hashlib.file_digest(existing_copy, 'sha256').hexdigest() == item[3]
+                    except FileNotFoundError:
+                        intact = False
+                    # A duplicate upload must also repair a missing/corrupt shared
+                    # copy. The filename alone does not prove the bytes are intact.
+                    if not intact:
+                        temporary = self.db.root / 'files' / f'.{item_id}.upload'
+                        try:
+                            shutil.copyfile(Path(staging) / item_id, temporary)
+                            os.replace(temporary, destination)
+                        finally:
+                            temporary.unlink(missing_ok=True)
+                conn.execute('INSERT INTO jobs VALUES (?,?,?)', (job_id, now(), course_id))
+                for item in items:
+                    conn.execute('''INSERT INTO job_items
+                                 (id,job_id,relative_path,kind,content_hash,blob,size,status,error,created_at)
+                                 VALUES (?,?,?,?,?,?,?,?,?,?)''', (item[0], job_id, *item[1:], now()))
         self.wakeup.set()
         return job_id
 
@@ -192,6 +220,8 @@ class Library:
 
     def retry(self, job_id: str, item_id: str, replace: bool):
         with self.db.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            require_editable(conn)
             item = conn.execute('SELECT * FROM job_items WHERE id=? AND job_id=?', (item_id, job_id)).fetchone()
             if not item:
                 raise KeyError('导入记录不存在')
@@ -199,11 +229,14 @@ class Library:
                 raise ValueError('此文件无需重试')
             if item['status'] == 'conflict' and not replace:
                 raise ValueError('请明确确认替换同路径资料')
-            conn.execute("UPDATE job_items SET status='queued',error=NULL,replace_existing=? WHERE id=?", (int(replace), item_id))
+            conn.execute("UPDATE job_items SET status='queued',error=NULL,dismissed=0,replace_existing=?,created_at=? WHERE id=?",
+                         (int(replace), now(), item_id))
         self.wakeup.set()
 
     def rebuild(self, document_id: str) -> str:
         with self.db.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            require_editable(conn)
             doc = conn.execute('SELECT * FROM documents WHERE id=?', (document_id,)).fetchone()
             if not doc:
                 raise KeyError('资料不存在')
@@ -218,52 +251,55 @@ class Library:
 
     def search(self, q: str, mode: str = 'all', course_id: str | None = None,
                category: str | None = None, document_id: str | None = None,
-               offset: int = 0, limit: int = 20, unit_offset: int = 0) -> dict:
-        query = Query.parse(q, mode)
+               offset: int = 0, limit: int = 20, unit_offset: int = 0, expand: bool = False,
+               sort: str = 'relevance') -> dict:
+        vocabulary = self.workspace.vocabulary() if expand else []
+        query = self.query(q, mode, course_id, expand, vocabulary)
+        lexicon_version = text_hash(json_dump(vocabulary)) if expand else None
         clauses, parameters = [], []
         for column, value in [('d.course_id', course_id), ('d.category', category), ('d.id', document_id)]:
             if value:
                 clauses.append(f'{column}=?')
                 parameters.append(value)
-        candidates, candidate_parameters = [], []
-        unindexed_term = False
-        for term in query.tokens:
-            if is_cjk(term[0]) and len(term) < 3:
-                unindexed_term = True
-                continue
-            table = 'units_tri' if is_cjk(term[0]) else 'units_fts'
-            candidates.append(f'u.rowid IN (SELECT rowid FROM {table} WHERE {table} MATCH ?)')
-            candidate_parameters.append('"' + term.replace('"', '""') + '"')
-        if candidates and not (mode == 'any' and unindexed_term):
-            join = ' OR ' if mode == 'any' else ' AND '
-            clauses.append('(' + join.join(candidates) + ')')
-            parameters.extend(candidate_parameters)
+        candidate_sql, candidate_parameters = query.candidates()
+        clauses.append(candidate_sql)
+        parameters.extend(candidate_parameters)
         sql = '''SELECT u.id AS unit_id,u.ordinal,u.label,u.text,u.normalized,u.mapping,
                  d.id AS document_id,d.name,d.kind,d.version,d.category,d.course_id,c.name AS course_name
                  FROM units u JOIN documents d ON d.id=u.document_id JOIN courses c ON c.id=d.course_id'''
         if clauses:
             sql += ' WHERE ' + ' AND '.join(clauses)
         groups: dict[str, dict] = {}
+        row_plans = {}
         with self.db.connect() as conn:
             for row in conn.execute(sql, parameters):
-                ranges = query.matches(row['normalized'], json.loads(row['mapping']))
+                actual_query = query
+                if expand and not course_id:
+                    if row['course_id'] not in row_plans:
+                        row_plans[row['course_id']] = self.query(q, mode, row['course_id'], True, vocabulary)
+                    actual_query = row_plans[row['course_id']]
+                ranges, details = actual_query.matches(row['normalized'], json.loads(row['mapping']))
                 if not ranges:
                     continue
                 doc_id = row['document_id']
                 group = groups.setdefault(doc_id, {
                     'document_id': doc_id, 'name': row['name'], 'kind': row['kind'],
                     'version': row['version'], 'category': row['category'], 'course_id': row['course_id'],
-                    'course_name': row['course_name'], 'hit_count': 0, 'hits': [], 'score': 0,
+                    'course_name': row['course_name'], 'hit_count': 0, 'hits': [], 'score': 0, 'exact': False,
                 })
                 score = len(ranges) / (1 + len(row['text']) / 800)
                 group['score'] = max(group['score'], score)
+                group['exact'] |= bool(query.original.matches(row['normalized'], json.loads(row['mapping'])))
                 group['hit_count'] += len(ranges)
                 group['hits'].append({'unit_id': row['unit_id'], 'ordinal': row['ordinal'],
                                       'page': row['ordinal'] + 1 if row['kind'] == 'pdf' else None,
                                       'label': row['label'], 'ranges': ranges,
-                                      'match_count': len(ranges), 'snippet': snippet(row['text'], ranges),
+                                      'lexicon_version': lexicon_version, 'match_count': len(ranges), 'matches': details, 'snippet': snippet(row['text'], ranges),
                                       'version': row['version']})
-        ordered = sorted(groups.values(), key=lambda group: (-group['score'], group['name'], group['document_id']))
+        category_order = self.workspace.preferences()['category_order']
+        ordered = sorted(groups.values(), key=lambda group: (
+            not group['exact'], category_order.index(group['category']) if sort == 'category' else 0,
+            -group['score'], group['name'], group['document_id']))
         total_hits = sum(group['hit_count'] for group in ordered)
         selected = ordered[offset:offset + limit]
         for group in selected:
@@ -273,18 +309,26 @@ class Library:
             group['next_unit_offset'] = unit_offset + len(group['hits']) if unit_offset + len(group['hits']) < group['unit_total'] else None
             del group['score']
         return {'groups': selected, 'total_documents': len(ordered), 'total_hits': total_hits,
-                'next_offset': offset + limit if offset + limit < len(ordered) else None}
+                'next_offset': offset + limit if offset + limit < len(ordered) else None,
+                'expansions': query.expansions}
 
-    def unit(self, document_id: str, unit_id: str, q: str | None = None, mode: str = 'all') -> dict:
+    def query(self, q, mode='all', course_id=None, expand=False, vocabulary=None):
+        vocabulary = (self.workspace.vocabulary() if vocabulary is None else vocabulary) if expand else []
+        if course_id:
+            vocabulary = [row for row in vocabulary if row['course_id'] is None or row['course_id'] == course_id]
+        return SearchPlan.create(q, mode, vocabulary)
+
+    def unit(self, document_id: str, unit_id: str, q: str | None = None, mode: str = 'all',
+             expand: bool = False, course_id: str | None = None, vocabulary=None) -> dict:
         with self.db.connect() as conn:
-            row = conn.execute('''SELECT u.*,d.version FROM units u JOIN documents d ON d.id=u.document_id
+            row = conn.execute('''SELECT u.*,d.version,d.course_id FROM units u JOIN documents d ON d.id=u.document_id
                                 WHERE u.document_id=? AND u.id=?''', (document_id, unit_id)).fetchone()
         if row is None:
             raise KeyError('位置已失效，请重新搜索（资料可能已重建）。')
         anchor = json.loads(row['anchor'])
-        ranges = Query.parse(q, mode).matches(row['normalized'], json.loads(row['mapping'])) if q else []
+        ranges, details = self.query(q, mode, course_id or row['course_id'], expand, vocabulary).matches(row['normalized'], json.loads(row['mapping'])) if q else ([], [])
         result = {'unit_id': row['id'], 'document_id': document_id, 'version': row['version'],
-                  'label': row['label'], 'text': row['text'], 'ranges': ranges,
+                  'label': row['label'], 'text': row['text'], 'ranges': ranges, 'matches': details,
                   'anchor': {key: value for key, value in anchor.items() if key not in ('boxes', 'lines')}}
         if anchor['type'] == 'page':
             result['rectangles'] = rectangles(anchor, ranges)

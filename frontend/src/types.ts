@@ -12,6 +12,7 @@ export interface DocumentRecord {
   course_name: string;
   name: string;
   relative_path: string;
+  content_hash: string;
   kind: "pdf" | "docx";
   category: Category;
   status: string;
@@ -43,6 +44,8 @@ export interface Hit {
   ordinal: number;
   label: string;
   ranges: Range[];
+  lexicon_version?: string | null;
+  matches?: MatchDetail[];
   match_count: number;
   version: number;
   snippet: { text: string; prefix: boolean; suffix: boolean; ranges: Range[] };
@@ -62,6 +65,7 @@ export interface Group {
 }
 export interface SearchResponse {
   groups: Group[];
+  expansions?: { term: string; source: string }[];
   total_documents: number;
   total_hits: number;
   next_offset: number | null;
@@ -96,6 +100,10 @@ export interface Selection {
   hit?: Hit;
   query?: string;
   mode?: Mode;
+  expand?: boolean;
+  course?: string;
+  position?: ReadingPosition;
+  visitId?: string;
 }
 export interface Stats {
   documents: number;
@@ -142,4 +150,99 @@ export function bytes(value: number) {
   return value < 1024 * 1024
     ? `${(value / 1024).toFixed(0)} KB`
     : `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+export interface SearchContext {
+  query: string;
+  mode: Mode;
+  course: string;
+  category: string;
+  document: string;
+  expand: boolean;
+  sort: "relevance" | "category";
+}
+export interface ReadingPosition {
+  document_id: string;
+  content_hash: string;
+  page?: number | null;
+  key?: string | null;
+  unit_id?: string | null;
+  text_hash?: string | null;
+  hit_unit_id?: string | null;
+  hit_page?: number | null;
+  hit_key?: string | null;
+  hit_text_hash?: string | null;
+  lexicon_version?: string | null;
+  excerpt?: string;
+  label?: string;
+  version?: number;
+  offset: number;
+  horizontal: number;
+  zoom: number;
+  rotation: 0 | 90 | 180 | 270;
+  match: number;
+  find: string;
+}
+export interface MatchDetail {
+  term: string;
+  source: "original" | "form" | "synonym";
+  range: Range;
+}
+export interface Bookmark {
+  id: string;
+  document_id: string;
+  name: string;
+  course_id: string;
+  course_name: string;
+  position: ReadingPosition;
+  status: "resolved" | "stale" | "missing";
+  note: string;
+  tags: string[];
+  updated_at: string;
+}
+export interface HistoryEntry {
+  id: string;
+  context: SearchContext;
+  updated_at: string;
+}
+export interface Preferences {
+  category_order: Category[];
+  shortcuts: Record<
+    "search" | "back" | "forward" | "bookmark" | "pane1" | "pane2",
+    string
+  >;
+}
+export interface VocabularyEntry {
+  id?: string;
+  course_id: string | null;
+  kind: "form" | "synonym";
+  terms: string[];
+}
+export interface ExamState {
+  active: boolean;
+  course_id?: string | null;
+  entered_at?: string;
+}
+export interface PreflightIssue {
+  name: string;
+  message: string;
+  job_id?: string;
+  item_id?: string;
+}
+export interface PreflightReport {
+  id: string;
+  course_id: string | null;
+  created_at: string;
+  stale?: boolean;
+  blockers: PreflightIssue[];
+  warnings: PreflightIssue[];
+  documents: {
+    id: string;
+    name: string;
+    version: number;
+    unit_count: number;
+    searchable_count: number;
+    indexed_at: string;
+    ok: boolean;
+  }[];
 }

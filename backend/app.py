@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 from contextlib import asynccontextmanager
@@ -18,8 +19,24 @@ from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .library import CATEGORIES, Library, now, uid
+from .db import FrozenLibrary, require_editable
+from .v2_api import install_v2
+from .workspace import text_hash, dump
 
 PROJECT = Path(__file__).resolve().parents[1]
+
+
+def storage_bytes(root: Path) -> int:
+    total = 0
+    for path in root.rglob('*'):
+        try:
+            info = path.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            # SQLite removes WAL/SHM files when the last connection closes.
+            continue
+        if stat.S_ISREG(info.st_mode):
+            total += info.st_size
+    return total
 
 
 class Configure(BaseModel):
@@ -55,7 +72,7 @@ def create_app(config_path: Path | None = None, library_path: Path | None = None
         if app.state.library:
             await asyncio.to_thread(app.state.library.stop)
 
-    app = FastAPI(title='书间 · 本地课程检索', version='1.0.0', lifespan=lifespan,
+    app = FastAPI(title='书间 · 本地课程检索', version='2.0.0', lifespan=lifespan,
                   docs_url=None, redoc_url=None)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=['127.0.0.1', 'localhost', 'testserver'])
 
@@ -83,6 +100,10 @@ def create_app(config_path: Path | None = None, library_path: Path | None = None
         )
         return response
 
+    @app.exception_handler(FrozenLibrary)
+    async def frozen_library(_request, exc):
+        return JSONResponse({'detail': str(exc)}, status_code=409)
+
     @app.exception_handler(ValueError)
     async def invalid_value(_request, exc):
         return JSONResponse({'detail': str(exc)}, status_code=400)
@@ -106,7 +127,7 @@ def create_app(config_path: Path | None = None, library_path: Path | None = None
 
     @app.get('/api/health')
     def health():
-        return {'app': 'course-search', 'version': '1.0.0', 'configured': app.state.library is not None}
+        return {'app': 'course-search', 'version': '2.0.0', 'configured': app.state.library is not None}
 
     @app.get('/api/settings')
     def settings():
@@ -156,7 +177,7 @@ def create_app(config_path: Path | None = None, library_path: Path | None = None
                          coalesce(sum(unit_count),0) AS units,
                          coalesce(sum(searchable_count),0) AS searchable_units FROM documents''').fetchone())
             counts['pending'] = conn.execute("SELECT count(*) FROM job_items WHERE status IN ('queued','processing')").fetchone()[0]
-        counts['storage_bytes'] = sum(path.stat().st_size for path in lib.db.root.rglob('*') if path.is_file())
+        counts['storage_bytes'] = storage_bytes(lib.db.root)
         counts['library_path'] = str(lib.db.root)
         return counts
 
@@ -174,6 +195,8 @@ def create_app(config_path: Path | None = None, library_path: Path | None = None
         course = {'id': uid(), 'name': name, 'created_at': now()}
         try:
             with library().db.connect() as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                require_editable(conn)
                 conn.execute('INSERT INTO courses VALUES (:id,:name,:created_at)', course)
         except sqlite3.IntegrityError as exc:
             raise HTTPException(409, '课程名称已存在') from exc
@@ -188,7 +211,7 @@ def create_app(config_path: Path | None = None, library_path: Path | None = None
                 values.append(value)
         with library().db.connect() as conn:
             sql = '''SELECT d.id,d.course_id,d.name,d.relative_path,d.kind,d.category,d.version,d.status,
-                     d.unit_count,d.searchable_count,d.size,d.warning,d.created_at,c.name AS course_name
+                     d.content_hash,d.unit_count,d.searchable_count,d.size,d.warning,d.created_at,c.name AS course_name
                      FROM documents d JOIN courses c ON c.id=d.course_id'''
             if filters:
                 sql += ' WHERE ' + ' AND '.join(filters)
@@ -198,6 +221,8 @@ def create_app(config_path: Path | None = None, library_path: Path | None = None
     def update_document(document_id: str, body: CategoryUpdate):
         document(document_id)
         with library().db.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            require_editable(conn)
             conn.execute('UPDATE documents SET category=? WHERE id=?', (body.category, document_id))
         return {'ok': True}
 
@@ -236,8 +261,9 @@ def create_app(config_path: Path | None = None, library_path: Path | None = None
     def search(q: str = Query(min_length=1, max_length=500), mode: Literal['all','any','phrase'] = 'all',
                course_id: str | None = None, category: str | None = None,
                document_id: str | None = None, offset: int = Query(0, ge=0),
-               limit: int = Query(20, ge=1, le=100), unit_offset: int = Query(0, ge=0)):
-        return library().search(q, mode, course_id, category, document_id, offset, limit, unit_offset)
+               limit: int = Query(20, ge=1, le=100), unit_offset: int = Query(0, ge=0), expand: bool = False,
+               sort: Literal['relevance', 'category'] = 'relevance'):
+        return library().search(q, mode, course_id, category, document_id, offset, limit, unit_offset, expand, sort)
 
     @app.get('/api/documents/{document_id}/content')
     def content(document_id: str, version: int | None = None):
@@ -257,11 +283,17 @@ def create_app(config_path: Path | None = None, library_path: Path | None = None
 
     @app.get('/api/documents/{document_id}/units/{unit_id}')
     def unit(document_id: str, unit_id: str, q: str | None = Query(None, max_length=500),
-             mode: Literal['all','any','phrase'] = 'all', version: int | None = None):
-        result = library().unit(document_id, unit_id, q, mode)
+             mode: Literal['all','any','phrase'] = 'all', version: int | None = None,
+             expand: bool = False, course_id: str | None = None, lexicon_version: str | None = None):
+        vocabulary = library().workspace.vocabulary() if expand else []
+        if expand and lexicon_version and lexicon_version != text_hash(dump(vocabulary)):
+            raise HTTPException(409, '词表已更新，请重新搜索以获取一致的命中和高亮。')
+        result = library().unit(document_id, unit_id, q, mode, expand, course_id, vocabulary)
         if version is not None and result['version'] != version:
             raise HTTPException(409, '资料已更新，请重新搜索。')
         return result
+
+    install_v2(app, library)
 
     dist = dist_path or PROJECT / 'frontend' / 'dist'
     if dist.is_dir():
